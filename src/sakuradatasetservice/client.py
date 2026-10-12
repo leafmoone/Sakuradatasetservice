@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import socket
 import time
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -151,6 +153,8 @@ class DataServiceClient:
             if response["lease"] is not None:
                 raise DataServiceUnavailable("completed service returned a lease")
             return None
+        if response["lease"] is None:
+            return None
         try:
             descriptor = ShardLeaseDescriptor.from_dict(response["lease"])
         except DataServiceProtocolError:
@@ -158,6 +162,35 @@ class DataServiceClient:
         if descriptor.worker_id != worker_id or not descriptor.local_path.is_file():
             raise DataServiceUnavailable("data service lease identity is invalid")
         return descriptor
+
+    def acquire(self, worker_id: int) -> ShardLease | None:
+        descriptor = self.lease(worker_id)
+        return None if descriptor is None else ShardLease(self, descriptor)
+
+    def iter_leases(
+        self,
+        worker_id: int,
+        *,
+        poll_interval_seconds: float = 0.05,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[ShardLease]:
+        """Yield until globally done or cancelled; ACK before advancing.
+
+        An empty allocation with done=False is temporary, so poll at a bounded
+        cadence. Repeat mode is unbounded. Breaking never ACKs unfinished work.
+        """
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll interval must be positive")
+        while cancelled is None or not cancelled():
+            lease = self.acquire(worker_id)
+            if lease is None:
+                if self.health():
+                    return
+                time.sleep(poll_interval_seconds)
+                continue
+            yield lease
+            if not lease._acknowledged:
+                raise RuntimeError("acknowledge the lease before requesting another")
 
     def acknowledge(self, descriptor: ShardLeaseDescriptor) -> None:
         response = self._request(
@@ -197,6 +230,7 @@ class RankedDataServiceClient:
         self._offset = rank * workers_per_rank
         self._workers_per_rank = workers_per_rank
         self._leases: dict[str, ShardLeaseDescriptor] = {}
+        self._acked: OrderedDict[str, ShardLeaseDescriptor] = OrderedDict()
         self.identity = DataServiceSessionIdentity(
             dataset_id=delegate.identity.dataset_id,
             worker_count=workers_per_rank,
@@ -215,18 +249,84 @@ class RankedDataServiceClient:
         self._leases[descriptor.lease_id] = descriptor
         return replace(descriptor, worker_id=worker_id)
 
+    def acquire(self, worker_id: int) -> ShardLease | None:
+        descriptor = self.lease(worker_id)
+        return None if descriptor is None else ShardLease(self, descriptor)
+
+    def iter_leases(
+        self,
+        worker_id: int,
+        *,
+        poll_interval_seconds: float = 0.05,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> Iterator[ShardLease]:
+        """Yield until globally done or cancelled; ACK before advancing.
+
+        An empty allocation with done=False is temporary, so poll at a bounded
+        cadence. Repeat mode is unbounded. Breaking never ACKs unfinished work.
+        """
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll interval must be positive")
+        while cancelled is None or not cancelled():
+            lease = self.acquire(worker_id)
+            if lease is None:
+                if self.health():
+                    return
+                time.sleep(poll_interval_seconds)
+                continue
+            yield lease
+            if not lease._acknowledged:
+                raise RuntimeError("acknowledge the lease before requesting another")
+
     def acknowledge(self, descriptor: ShardLeaseDescriptor) -> None:
-        original = self._leases.pop(descriptor.lease_id, None)
+        original = self._leases.get(descriptor.lease_id) or self._acked.get(
+            descriptor.lease_id
+        )
         if (
             original is None
             or replace(original, worker_id=descriptor.worker_id) != descriptor
         ):
             raise DataServiceUnavailable("rank-local lease identity changed")
         self._delegate.acknowledge(original)
+        self._leases.pop(descriptor.lease_id, None)
+        self._acked[descriptor.lease_id] = original
+        while len(self._acked) > 16384:
+            self._acked.popitem(last=False)
 
 
 __all__ = [
     "DataServiceClient",
     "DataServiceUnavailable",
     "RankedDataServiceClient",
+    "ShardLease",
 ]
+
+
+class ShardLease:
+    """Explicit lease context: success ACKs; exceptions leave work unacknowledged.
+
+    Close any shard reader inside this context before it exits. Once ACKed, the
+    cache may evict the path. An exception keeps the same worker's lease available
+    for retry; it does not release or silently skip it.
+    """
+
+    def __init__(
+        self,
+        client: DataServiceClient | RankedDataServiceClient,
+        descriptor: ShardLeaseDescriptor,
+    ) -> None:
+        self.client = client
+        self.descriptor = descriptor
+        self._acknowledged = False
+
+    def acknowledge(self) -> None:
+        if not self._acknowledged:
+            self.client.acknowledge(self.descriptor)
+            self._acknowledged = True
+
+    def __enter__(self) -> ShardLeaseDescriptor:
+        return self.descriptor
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        if exc_type is None:
+            self.acknowledge()

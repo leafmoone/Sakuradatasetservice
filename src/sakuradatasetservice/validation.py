@@ -17,8 +17,6 @@ from sakuradatasetservice.modelscope import (
 from sakuradatasetservice.providers import DatasetProvider
 
 VALIDATION_SELECTION_SEED = 44
-VALIDATION_SHARD_COUNT = 7
-VALIDATION_SHARD_PATHS: tuple[str, ...] = ()
 
 
 class ValidationSelectionError(ValueError):
@@ -252,8 +250,6 @@ def require_published_validation_shards(
 
 __all__ = [
     "VALIDATION_SELECTION_SEED",
-    "VALIDATION_SHARD_COUNT",
-    "VALIDATION_SHARD_PATHS",
     "PreparedValidationShards",
     "ValidationSelection",
     "ValidationSelectionError",

@@ -51,7 +51,6 @@ def test_service_accepts_two_method_provider(tmp_path):
         DataServiceSessionIdentity,
         DataSupplyService,
     )
-    from sakuradatasetservice.validation import ValidationSelection
 
     source = tmp_path / "source"
     source.mkdir()
@@ -70,13 +69,9 @@ def test_service_accepts_two_method_provider(tmp_path):
     manifest = provider.fetch_manifest(
         DatasetSourceIdentity(repo_id="local/test", revision="v1")
     )
-    selection = ValidationSelection(
-        "test", manifest.dataset_id, 44, (manifest.shards[0],)
-    )
     cache = ShardCache(tmp_path / "cache", manifest, provider, CacheQuota(0, 100))
     service = DataSupplyService(
         manifest,
-        selection,
         cache,
         tmp_path / "queue.json",
         tmp_path / "owner.lock",

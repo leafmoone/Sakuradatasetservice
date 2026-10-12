@@ -1,7 +1,7 @@
 """Independent dataset delivery. Training transforms belong to the consumer."""
 
 from .cache import CacheQuota, ShardCache
-from .client import DataServiceClient, RankedDataServiceClient
+from .client import DataServiceClient, RankedDataServiceClient, ShardLease
 from .config import DataSourceConfig, DataTransportConfig
 from .manifest import DatasetManifest, DatasetSourceIdentity, ShardRecord
 from .modelscope import ModelScopeDatasetTransport
@@ -25,6 +25,7 @@ __all__ = [
     "ModelScopeDatasetTransport",
     "RankedDataServiceClient",
     "ShardCache",
+    "ShardLease",
     "ShardLeaseDescriptor",
     "ShardRecord",
 ]

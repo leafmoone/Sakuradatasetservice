@@ -600,6 +600,8 @@ def fetch_dataset_shard(
     partial = destination.with_name(f"{destination.name}.partial")
     assembly = destination.with_name(f"{destination.name}.partial.assembling")
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink():
+        raise ShardIntegrityError("cached shard must not be a symlink")
     if _verify_existing(destination, shard):
         return FetchedShard(
             destination,
@@ -610,16 +612,28 @@ def fetch_dataset_shard(
     if destination.exists():
         raise ShardIntegrityError("cached shard differs from manifest")
     prefix_bytes = _require_regular_partial(partial, maximum_bytes=shard.bytes)
+    ranges = (
+        _download_ranges(prefix_bytes, shard.bytes - 1, transport.streams_per_shard)
+        if prefix_bytes < shard.bytes
+        else ()
+    )
+    parts = tuple(
+        (start, end, _range_path(partial, start, end)) for start, end in ranges
+    )
+    expected_parts = {path for _, _, path in parts}
+    retained_parts = tuple(partial.parent.glob(f"{partial.name}.range-*"))
+    _require_regular_partial(assembly, maximum_bytes=shard.bytes)
+    for path in retained_parts:
+        _require_regular_partial(path, maximum_bytes=shard.bytes)
+    # A crash can leave an assembly copy, or changing stream count can leave
+    # unusable ranges. Remove these before writing so the live prefix/ranges plus
+    # the assembly never exceed twice the manifest size. Matching ranges resume.
+    assembly.unlink(missing_ok=True)
+    for path in retained_parts:
+        if path not in expected_parts:
+            path.unlink()
     if prefix_bytes < shard.bytes:
         partial.touch(exist_ok=True)
-        ranges = _download_ranges(
-            prefix_bytes,
-            shard.bytes - 1,
-            transport.streams_per_shard,
-        )
-        parts = tuple(
-            (start, end, _range_path(partial, start, end)) for start, end in ranges
-        )
         existing_part_bytes = 0
         for start, end, path in parts:
             existing_part_bytes += _require_regular_partial(
@@ -640,8 +654,15 @@ def fetch_dataset_shard(
             with path.open("ab") as handle:
 
                 class _PartWriter:
+                    remaining = end - start + 1 - existing
+
                     def write(self, payload: bytes) -> int:
+                        if len(payload) > self.remaining:
+                            raise ShardIntegrityError(
+                                "downloaded range is larger than manifest"
+                            )
                         written = handle.write(payload)
+                        self.remaining -= written
                         tracker.add(written)
                         return written
 

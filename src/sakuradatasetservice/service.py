@@ -31,12 +31,8 @@ from sakuradatasetservice.service_protocol import (
     canonical_json_bytes,
     parse_frame,
 )
-from sakuradatasetservice.validation import (
-    ValidationSelection,
-    validate_selection_manifest,
-)
 
-_QUEUE_SCHEMA_VERSION = 2
+_QUEUE_SCHEMA_VERSION = 3
 
 _CLIENT_DISCONNECTED_ERRNOS = frozenset(
     {
@@ -48,9 +44,7 @@ _CLIENT_DISCONNECTED_ERRNOS = frozenset(
     }
 )
 
-# Leases retired by an epoch rollover are kept (bounded) so that the ranks'
-# late ACKs — their workers may still be streaming the retired shards behind
-# a full prefetch queue — are accepted idempotently instead of raising.
+# Successful ACKs are retained in a bounded in-memory retry window.
 _RETIRED_LEASE_CAP = 16384
 
 
@@ -101,8 +95,7 @@ class _Row:
 
 @dataclass(frozen=True, slots=True)
 class _RetiredLease:
-    """A lease retired by an epoch-boundary force rollover, still awaiting
-    the rank's late ACK so it can be accepted idempotently."""
+    """A completed lease retained only for idempotent ACK retry."""
 
     path: str
     state_revision: int
@@ -115,12 +108,8 @@ class _QueueState:
     rows: tuple[_Row, ...]
 
     @property
-    def completed_epochs(self) -> int:
-        return self.cycle
-
-    @property
     def current_epoch(self) -> int:
-        return self.completed_epochs + 1
+        return self.cycle + 1
 
 
 class _QueueStore:
@@ -128,16 +117,18 @@ class _QueueStore:
         self,
         path: Path,
         manifest: DatasetManifest,
-        selection: ValidationSelection,
+        excluded_paths: frozenset[str],
     ) -> None:
-        validate_selection_manifest(selection, manifest)
         self.path = path
-        excluded = frozenset(selection.shard_paths)
+        self.manifest = manifest
+        excluded = excluded_paths
+        if not excluded <= {item.path for item in manifest.shards}:
+            raise DataServiceError("excluded paths are absent from manifest")
         self.paths = frozenset(
             item.path for item in manifest.shards if item.path not in excluded
         )
         if not self.paths:
-            raise DataServiceError("validation selection leaves no training shards")
+            raise DataServiceError("exclusions leave no available shards")
 
     def new(self, cycle: int) -> _QueueState:
         # Canonical input order: self.paths is a frozenset whose
@@ -183,31 +174,15 @@ class _QueueStore:
             if not isinstance(document, dict):
                 raise TypeError
             raw = cast(dict[str, Any], document)
-            schema_version = raw.get("schema_version")
-            if schema_version == 1:
-                if set(raw) != {"cycle", "rows", "schema_version"}:
-                    raise ValueError
-            elif schema_version == _QUEUE_SCHEMA_VERSION:
-                if set(raw) != {
-                    "completed_epochs",
-                    "current_epoch",
-                    "cycle",
-                    "rows",
-                    "schema_version",
-                }:
-                    raise ValueError
-            else:
+            if set(raw) != {"cycle", "rows", "schema_version", "manifest"}:
+                raise ValueError
+            if raw["schema_version"] != _QUEUE_SCHEMA_VERSION or raw[
+                "manifest"
+            ] != self.manifest.model_dump(mode="json"):
                 raise ValueError
             cycle = raw["cycle"]
             if type(cycle) is not int:
                 raise TypeError
-            if schema_version == _QUEUE_SCHEMA_VERSION and (
-                type(raw["completed_epochs"]) is not int
-                or type(raw["current_epoch"]) is not int
-                or raw["completed_epochs"] != cycle
-                or raw["current_epoch"] != cycle + 1
-            ):
-                raise ValueError
             raw_rows = raw["rows"]
             if not isinstance(raw_rows, list):
                 raise TypeError
@@ -240,8 +215,7 @@ class _QueueStore:
         self._validate(state)
         payload = canonical_json_bytes(
             {
-                "completed_epochs": state.completed_epochs,
-                "current_epoch": state.current_epoch,
+                "manifest": self.manifest.model_dump(mode="json"),
                 "cycle": state.cycle,
                 "rows": [
                     {"path": row.path, "status": row.status} for row in state.rows
@@ -269,13 +243,17 @@ class DataSupplyService:
     def __init__(
         self,
         manifest: DatasetManifest,
-        validation_selection: ValidationSelection,
         cache: ShardCache,
         mainset_path: Path,
         ownership_lock_path: Path,
         identity: DataServiceSessionIdentity,
         limits: DataServiceLimits,
+        *,
+        excluded_paths: frozenset[str] = frozenset(),
+        repeat: bool = False,
     ) -> None:
+        if cache.manifest != manifest:
+            raise DataServiceError("cache manifest differs from service manifest")
         if manifest.dataset_id != identity.dataset_id:
             raise DataServiceError("service dataset differs from session")
         if (
@@ -291,11 +269,14 @@ class DataSupplyService:
             )
         if not ownership_lock_path.is_absolute() or ownership_lock_path.is_symlink():
             raise DataServiceError("service ownership lock path is invalid")
+        if type(repeat) is not bool:
+            raise ValueError("repeat must be boolean")
+        self.repeat = repeat
         self.manifest = manifest
         self.cache = cache
         self.identity = identity
         self.limits = limits
-        self.store = _QueueStore(mainset_path, manifest, validation_selection)
+        self.store = _QueueStore(mainset_path, manifest, excluded_paths)
         self.ownership_lock_path = ownership_lock_path
         self._state: _QueueState | None = None
         self._executor = ThreadPoolExecutor(
@@ -355,7 +336,7 @@ class DataSupplyService:
             self._started = True
             _log(
                 f"训练分片队列: epoch={state.current_epoch}, "
-                f"completed_epochs={state.completed_epochs}, cycle={state.cycle}, "
+                f"allocation_cycle={state.cycle}, "
                 f"shards={len(state.rows)}, "
                 f"workers={self.identity.worker_count}"
             )
@@ -382,6 +363,9 @@ class DataSupplyService:
             if row.status == "pending" and row.path not in leased
         )
 
+    def _current_ready_paths(self) -> set[str]:
+        return set(self._pending_paths()).intersection(self._ready)
+
     def _protected_paths(self) -> frozenset[str]:
         return frozenset(
             {
@@ -394,15 +378,17 @@ class DataSupplyService:
     def _schedule_lookahead(self) -> None:
         occupied = len(self._ready) + len(self._futures)
         candidates = list(self._pending_paths())
-        if len(candidates) < self.limits.verified_shard_lookahead:
+        if self.repeat and len(candidates) < self.limits.verified_shard_lookahead:
             # Cross-cycle lookahead: once the current cycle is about to drain,
             # start downloading the NEXT cycle's leading shards (deterministic
             # per-cycle order) so the epoch boundary stays warm instead of a
             # cold-start download gap that starves the DDP ranks.
-            seen = set(candidates)
+            seen = set(candidates) | {
+                item.record.path for item in self._outstanding.values()
+            }
             for row in self.store.new(self.state.cycle + 1).rows:
-                if row.path in seen or occupied >= self.limits.verified_shard_lookahead:
-                    break
+                if row.path in seen:
+                    continue
                 seen.add(row.path)
                 candidates.append(row.path)
         for path in candidates:
@@ -467,12 +453,18 @@ class DataSupplyService:
 
     def _wait_for_ready_count(self, count: int) -> None:
         announced = False
-        while len(self._ready) < count:
+        while len(self._current_ready_paths()) < count:
             if self._cancelled():
                 raise _ServiceStopping
             self._collect_completed()
-            if len(self._ready) >= count:
+            if len(self._current_ready_paths()) >= count:
                 return
+            # Future-cycle ready entries must not fill every prefetch slot while
+            # the current queue is waiting for different shards.
+            pending = set(self._pending_paths())
+            for path in tuple(self._ready):
+                if path not in pending:
+                    self._ready.pop(path)
             self._schedule_lookahead()
             if not self._futures:
                 raise DataServiceError("data service has no shard to prepare")
@@ -503,7 +495,7 @@ class DataSupplyService:
                 self._force_roll_over_if_wedge()
             pending_count = len(self._pending_paths())
             if pending_count <= 0:
-                raise DataServiceError("data service has no remaining training shard")
+                return True
             ready_count = min(self.identity.worker_count, pending_count)
             if ready_count < self.identity.worker_count:
                 _log(
@@ -589,11 +581,10 @@ class DataSupplyService:
                     and retired.state_revision == state_revision
                     and retired.worker_id == worker_id
                 ):
-                    # The epoch-boundary force rollover already completed this
-                    # lease; the rank's late ACK is safe to swallow.
+                    # A response may have been lost after the successful ACK.
                     _log(
                         f"worker={worker_id} 完成分片(幂等): {retired.path} "
-                        f"(租约已在 epoch 边界 rollover 中退休，重复 ACK 忽略)"
+                        f"(已完成，重复 ACK 忽略)"
                     )
                     return
                 raise DataServiceError("ACK does not match an active lease")
@@ -606,73 +597,33 @@ class DataSupplyService:
             self._complete_lease(descriptor)
 
     def _complete_lease(self, descriptor: ShardLeaseDescriptor) -> None:
-        """Mark a lease's shard completed (rollover-aware). Caller holds _lock."""
-        completed_state = self._state_with_status(descriptor.record.path, "completed")
-        completed_epoch: int | None = None
-        if all(row.status == "completed" for row in completed_state.rows):
-            completed_epoch = completed_state.current_epoch
-            next_state = self.store.new(completed_state.cycle + 1)
-            if next_state.completed_epochs != completed_epoch:
-                raise DataServiceError("data epoch rollover identity is invalid")
-            self._commit_state(next_state)
-        else:
-            self._commit_state(completed_state)
-        del self._outstanding[descriptor.lease_id]
-        del self._worker_leases[descriptor.worker_id]
-        _log(f"worker={descriptor.worker_id} 完成分片: {descriptor.record.path}")
-        if completed_epoch is not None:
-            _log(
-                f"数据 epoch 完成: epoch={completed_epoch}, "
-                f"completed_epochs={self.state.completed_epochs}, "
-                f"shards={len(self.state.rows)}; "
-                f"已重建 epoch={self.state.current_epoch} 队列"
-            )
+        # A slow consumer can still hold an earlier cycle's file. Its ACK must
+        # release only that lease, never complete a newer cycle's queue row.
+        if descriptor.cycle_index == self.state.cycle:
+            completed = self._state_with_status(descriptor.record.path, "completed")
+            if self.repeat and all(row.status == "completed" for row in completed.rows):
+                completed = self.store.new(completed.cycle + 1)
+            self._commit_state(completed)
+        self._retire_lease(descriptor)
         self._schedule_lookahead()
 
     def _force_roll_over_if_wedge(self) -> None:
-        """Force-complete the epoch when the queue has drained but leases are
-        still outstanding.
+        """Advance allocation, without claiming outstanding work was completed.
 
-        At an epoch boundary the ranks can otherwise wait circularly: the rank
-        whose shards are all done starves in its drain loop waiting for the
-        rollover, while the rank holding the last un-ACKed leases sits in the
-        cross-rank allreduce and can no longer process the completions (and
-        therefore ACK the leases) that would trigger the rollover.  Completing
-        the epoch here — retiring the still-outstanding leases so their late
-        ACKs become no-ops — is lossless for a cyclic dataset: the shard data
-        already buffered inside a rank is still consumed in order, and those
-        shards are re-served (and fully consumed) in the next cycle.  This
-        must stay a lease-time check rather than a time threshold: a healthy
-        lease outlives the NCCL watchdog by an order of magnitude
-        (~26 min per shard vs 300 s), so no timeout value could both avoid
-        force-completing healthy leases and fire before the watchdog.
-        Caller holds _lock.
+        Repeat mode may allocate the next cycle while slow consumers still hold
+        earlier leases. Those leases remain pinned and ACKable until consumed.
+        Cycle counters describe allocation cycles, not globally completed epochs.
         """
-        if not self._outstanding:
+        if not self.repeat or self._pending_paths():
             return
-        completed_epoch = self.state.current_epoch
-        retired = 0
-        for descriptor in list(self._outstanding.values()):
-            self._retire_lease(descriptor)
-            retired += 1
-        next_state = self.store.new(self.state.cycle + 1)
-        if next_state.completed_epochs != completed_epoch:
-            raise DataServiceError("data epoch rollover identity is invalid")
-        self._commit_state(next_state)
-        _log(
-            f"epoch 边界强制完成: epoch={completed_epoch}, "
-            f"退休未完成租约={retired}, "
-            f"completed_epochs={self.state.completed_epochs}, "
-            f"shards={len(self.state.rows)}; "
-            f"已重建 epoch={self.state.current_epoch} 队列"
-        )
+        leased = {item.record.path for item in self._outstanding.values()}
+        if not self.store.paths.difference(leased):
+            return
+        self._commit_state(self.store.new(self.state.cycle + 1))
         self._schedule_lookahead()
 
     def _retire_lease(self, descriptor: ShardLeaseDescriptor) -> None:
-        """Move an outstanding lease to the retired set so the rank's late
-        ACK (its worker may still be streaming the shard behind a full
-        prefetch queue) is accepted as an idempotent no-op. Caller holds
-        _lock."""
+        """Remember successful ACKs in a bounded process-local retry window."""
         self._retired_leases[descriptor.lease_id] = _RetiredLease(
             path=descriptor.record.path,
             state_revision=descriptor.state_revision,
@@ -685,7 +636,10 @@ class DataSupplyService:
 
     @property
     def done(self) -> bool:
-        return False
+        with self._lock:
+            return not self.repeat and all(
+                row.status == "completed" for row in self.state.rows
+            )
 
     @property
     def stats(self) -> DataServiceStats:
@@ -788,7 +742,7 @@ class DataServiceServer:
                 raise DataServiceError("data service session changed")
             descriptor = self.service.lease(request["worker_id"])
             return {
-                "done": descriptor is None,
+                "done": self.service.done,
                 "lease": None if descriptor is None else descriptor.as_dict(),
                 "ok": True,
             }
