@@ -21,6 +21,20 @@ python -m build --wheel
 No public package publication or license grant is implied. This private repository's
 license is unspecified.
 
+## Minimal command line
+
+```sh
+sakura-dataset-service manifest --local-root my-shards --repo-id local/my-corpus --revision v1 --output manifest.json
+sakura-dataset-service serve --local-root my-shards --manifest manifest.json --cache-root cache-v1 --state-dir service-state --cache-high-bytes 4294967296
+```
+
+`python -m sakuradatasetservice` is equivalent. Replace `--local-root` with
+`--modelscope` for the included remote provider. `serve` defaults to once mode;
+`--repeat` enables cyclic supply, `--workers` sets consumer topology and repeated
+`--exclude` flags omit explicit shard paths. Stop the service with SIGINT/SIGTERM.
+The service stays available after once-mode completion so clients can read completion
+and retry recent ACKs. Manifest creation refuses to overwrite an existing file.
+
 ## Provider boundary
 
 A `DatasetProvider` supplies just two operations:
@@ -92,8 +106,12 @@ server.serve(stop)
 In another same-host process, after the service is ready:
 
 ```python
+import threading
+from pathlib import Path
 from sakuradatasetservice import DataServiceClient
 
+state = Path("service-state").resolve()
+stop = threading.Event()  # set from the application when cancellation is needed
 client = DataServiceClient(state / "data.sock", worker_count=2,
                            request_timeout_seconds=30.0)
 for lease in client.iter_leases(worker_id=0, cancelled=stop.is_set):
@@ -147,3 +165,17 @@ user. Socket permissions are 0600. This is not a cross-host/network service.
 
 The `validation` helpers remain optional. No fixed validation shard count or training
 transform policy is imposed by the service.
+
+## Verification scope
+
+Core tests cover provider boundaries, exact cache ownership, concurrent transfer peaks,
+lease/readiness/ACK behavior, restart state, real tiny tar consumption through JSON
+client/server dispatch, and local CLI inventory creation. Wheel installation/import is
+checked in a fresh environment without Torch installed.
+
+Actual Unix-socket acceptance is **not yet verified** in the current execution environment:
+its OS socket creation returns EPERM, including the permitted elevated test run. The
+three real socket integration cases are explicitly skipped with a BLOCKED reason there;
+in-process dispatch tests are separate and do not substitute for socket coverage.
+Run the suite on the intended Linux host before production use. No live ModelScope
+account/download, production-scale throughput or distributed training test is claimed.

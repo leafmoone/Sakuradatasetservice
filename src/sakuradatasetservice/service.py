@@ -1,4 +1,4 @@
-"""Local shard cache service used by the training process."""
+"""Local shard cache service for independent consumers."""
 
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ class _QueueState:
     rows: tuple[_Row, ...]
 
     @property
-    def current_epoch(self) -> int:
+    def allocation_round(self) -> int:
         return self.cycle + 1
 
 
@@ -131,21 +131,9 @@ class _QueueStore:
             raise DataServiceError("exclusions leave no available shards")
 
     def new(self, cycle: int) -> _QueueState:
-        # Canonical input order: self.paths is a frozenset whose
-        # iteration order is per-process (string hash
-        # randomization). The shuffle must start from
-        # sorted(paths) — the only input arrangement that is
-        # bit-identical across processes, restarts, and experiment
-        # arms — otherwise two fresh cycle-0 runs consume different
-        # sample sequences despite identical manifest and seed.
+        # Sorting before deterministic per-cycle shuffling makes restart order
+        # independent of Python hash randomization and matches lookahead order.
         paths = sorted(self.paths)
-        # Deterministic per-cycle order: the cross-cycle lookahead in
-        # _schedule_lookahead pre-downloads the NEXT cycle's leading shards
-        # while the current cycle still drains. Those pre-downloads only
-        # match the order the real epoch roll produces when every cycle's
-        # shuffle is a pure function of its cycle number, so the boundary
-        # finds a warm pipeline instead of a cold-start download gap that
-        # starves the DDP ranks and trips the 300s NCCL watchdog.
         seed = (0x9E3779B97F4A7C15 * (cycle + 1)) & 0xFFFFFFFFFFFFFFFF
         random.Random(seed).shuffle(paths)
         return _QueueState(cycle, tuple(_Row(path, "pending") for path in paths))
@@ -335,7 +323,7 @@ class DataSupplyService:
             self._state = state
             self._started = True
             _log(
-                f"训练分片队列: epoch={state.current_epoch}, "
+                f"分片队列: round={state.allocation_round}, "
                 f"allocation_cycle={state.cycle}, "
                 f"shards={len(state.rows)}, "
                 f"workers={self.identity.worker_count}"
@@ -379,10 +367,8 @@ class DataSupplyService:
         occupied = len(self._ready) + len(self._futures)
         candidates = list(self._pending_paths())
         if self.repeat and len(candidates) < self.limits.verified_shard_lookahead:
-            # Cross-cycle lookahead: once the current cycle is about to drain,
-            # start downloading the NEXT cycle's leading shards (deterministic
-            # per-cycle order) so the epoch boundary stays warm instead of a
-            # cold-start download gap that starves the DDP ranks.
+            # Prepare eligible paths for the next allocation round without
+            # reissuing a path still held by any consumer.
             seen = set(candidates) | {
                 item.record.path for item in self._outstanding.values()
             }
@@ -489,17 +475,15 @@ class DataSupplyService:
         with self._lock:
             self._require_running()
             if not self._pending_paths():
-                # A process starting exactly at an epoch boundary must not
-                # fail fast while un-ACKed leases block the rollover; give
-                # the boundary one force-rollover chance, same as lease().
-                self._force_roll_over_if_wedge()
+                # A resumed repeat queue can start at an allocation boundary.
+                self._advance_repeat_cycle()
             pending_count = len(self._pending_paths())
             if pending_count <= 0:
                 return True
             ready_count = min(self.identity.worker_count, pending_count)
             if ready_count < self.identity.worker_count:
                 _log(
-                    f"epoch 尾部仅剩 {ready_count} 个分片; "
+                    f"分配轮次尾部仅剩 {ready_count} 个分片; "
                     f"允许少于 {self.identity.worker_count} 个 worker 的启动屏障"
                 )
             try:
@@ -550,7 +534,7 @@ class DataSupplyService:
             if len(self._outstanding) >= self.limits.lease_channel_capacity:
                 raise DataServiceError("lease capacity is exhausted")
             if not self._pending_paths():
-                self._force_roll_over_if_wedge()
+                self._advance_repeat_cycle()
             if not self._pending_paths():
                 return None
             path, cached = self._take_ready()
@@ -607,7 +591,7 @@ class DataSupplyService:
         self._retire_lease(descriptor)
         self._schedule_lookahead()
 
-    def _force_roll_over_if_wedge(self) -> None:
+    def _advance_repeat_cycle(self) -> None:
         """Advance allocation, without claiming outstanding work was completed.
 
         Repeat mode may allocate the next cycle while slow consumers still hold
@@ -699,6 +683,42 @@ def _client_disconnected(error: OSError) -> bool:
         )
         or error.errno in _CLIENT_DISCONNECTED_ERRNOS
     )
+
+
+def _prepare_socket_path(path: Path) -> None:
+    """Remove only a verified stale socket; ambiguous failures preserve it."""
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not stat.S_ISSOCK(path.stat().st_mode):
+        raise DataServiceError("data service socket path is occupied")
+    original_inode = path.stat().st_ino
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.1)
+        try:
+            probe.connect(str(path))
+        except OSError as error:
+            if error.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
+                raise DataServiceError(
+                    "existing socket could not be safely checked"
+                ) from error
+            try:
+                current = path.lstat()
+            except FileNotFoundError:
+                return
+            if (
+                error.errno == errno.ENOENT
+                or current.st_ino != original_inode
+                or not stat.S_ISSOCK(current.st_mode)
+            ):
+                raise DataServiceError(
+                    "socket path changed during stale-socket check"
+                ) from error
+            path.unlink()
+        else:
+            raise DataServiceError("another data service owns the socket")
+    finally:
+        probe.close()
 
 
 class DataServiceServer:
@@ -806,26 +826,12 @@ class DataServiceServer:
         bound_inode: int | None = None
         try:
             self.service.start(stop_event)
-            if self.socket_path.exists() or self.socket_path.is_symlink():
-                if self.socket_path.is_symlink() or not stat.S_ISSOCK(
-                    self.socket_path.stat().st_mode
-                ):
-                    raise DataServiceError("data service socket path is occupied")
-                probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                try:
-                    probe.settimeout(0.1)
-                    probe.connect(str(self.socket_path))
-                except OSError:
-                    self.socket_path.unlink(missing_ok=True)
-                else:
-                    raise DataServiceError("another data service owns the socket")
-                finally:
-                    probe.close()
+            _prepare_socket_path(self.socket_path)
             # Readiness contract: the socket file must not exist
             # until the warmup barrier passes. Consumers
-            # (training_stack.sh) treat socket existence as
+            # (service launchers) treat socket existence as
             # "protocol servable"; creating it before
-            # wait_until_ready() lets the trainer connect into an
+            # wait_until_ready() lets a consumer connect into an
             # empty backlog while the accept loop still waits for
             # ready shards, and the client's health timeout
             # expires.
