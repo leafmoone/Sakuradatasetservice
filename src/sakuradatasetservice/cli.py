@@ -40,6 +40,16 @@ def _source_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return parsed
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Same-host pluggable dataset shard delivery (Linux)"
@@ -62,6 +72,18 @@ def main(argv: list[str] | None = None) -> None:
     serve.add_argument("--cache-root", type=Path, required=True)
     serve.add_argument("--state-dir", type=Path, required=True)
     serve.add_argument("--workers", type=int, default=1)
+    serve.add_argument(
+        "--sampling",
+        choices=("shuffle", "balance"),
+        default="shuffle",
+        help="shuffle all candidates, or choose one tar per parent folder per cycle",
+    )
+    serve.add_argument(
+        "--seed",
+        type=_nonnegative_int,
+        default=0,
+        help="nonnegative balance sampler seed (shuffle keeps its historical order)",
+    )
     serve.add_argument("--download-concurrency", type=int, default=1)
     serve.add_argument("--cache-low-bytes", type=int, default=0)
     serve.add_argument("--cache-high-bytes", type=int, required=True)
@@ -104,6 +126,8 @@ def main(argv: list[str] | None = None) -> None:
         ),
         repeat=args.repeat,
         excluded_paths=frozenset(args.exclude),
+        sampling=args.sampling,
+        seed=args.seed,
     )
     server = DataServiceServer(
         service, state / "data.sock", request_timeout_seconds=30.0

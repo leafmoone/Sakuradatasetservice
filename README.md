@@ -96,6 +96,8 @@ service = DataSupplyService(
                       lease_channel_capacity=2, ack_channel_capacity=2),
     excluded_paths=frozenset(),  # optional, e.g. validation shards
     repeat=False,
+    sampling="shuffle",  # default; "balance" chooses one tar per parent folder
+    seed=0,              # nonnegative integer, used only by balance
 )
 server = DataServiceServer(service, state / "data.sock", request_timeout_seconds=30.0)
 stop = threading.Event()
@@ -131,10 +133,56 @@ rank-local IDs to the global worker topology, without importing a distributed ru
 The socket and shard paths must be on the same host and accessible to the same trusted
 user. Socket permissions are 0600. This is not a cross-host/network service.
 
+## Folder-balanced sampling
+
+`sampling="shuffle"` (the default) retains the original all-candidate queue and
+historical per-cycle order; `seed` does not change shuffle order. To opt in to
+folder scheduling through the API, use `DataSupplyService(..., sampling="balance",
+seed=44, repeat=True)`. The CLI exposes the same options:
+
+```sh
+sakura-dataset-service serve --local-root my-shards --manifest manifest.json --cache-root balance-cache --state-dir balance-state --cache-high-bytes 4294967296 --sampling balance --seed 44 --repeat
+```
+
+Balance starts from the **complete fixed local manifest**, removes `excluded_paths`
+(CLI `--exclude`), then groups the remaining paths by POSIX parent directory. Root
+files share the `.` group; a fully excluded folder contributes no tar. Each cycle
+chooses one tar uniformly within each nonempty folder, then shuffles those chosen
+tars. Sorted folder/candidate inputs and a private `random.Random` seeded with
+`f"balance:{seed}:{cycle}"` make restart, next-cycle lookahead and actual allocation
+agree without changing global RNG state. This is the same ordering algorithm as
+SakuraMoon's balance option for the same candidates, exclusions, seed and cycle.
+A folder with many tars gets the same number of selections as a singleton folder;
+this does not balance sample counts, bytes or consumer updates. Cross-cycle repeats
+are allowed and finite-cycle coverage of every candidate is not guaranteed.
+
+Balance **once mode selects one tar per folder**, not every tar in the manifest.
+Completion still waits for every selected tar's ACK. In repeat mode, cycles remain
+allocation rounds, not completed epochs: old leases stay held and pinned; a path
+is never leased concurrently twice, and an older-cycle ACK only releases its lease.
+If every tar selected for the next round is currently held, a free worker gets
+`None` temporarily without advancing/spinning through empty cycles; consumers must
+continue processing/ACKing outstanding leases. Selection is not redrawn to avoid
+held paths. Other available selected folders can proceed normally.
+
+The queue stays self-contained: balance schema4 records mode, seed, the exact
+excluded path set and the existing complete manifest binding. Restore checks these
+and the exact cycle selection/order. Legacy schema3 remains shuffle-only and is
+still written by shuffle; neither mode automatically imports the other's queue,
+even if one tar per folder makes their candidate memberships equal. Changing
+sampling, balance seed, exclusions or manifest requires a **new state file** after
+a controlled stop of the service and consumers. Keep old state if its progress is
+needed. Use independent state/socket/lock directories for concurrent services and
+a separate cache for each cache owner; cache ownership always covers the full
+manifest, never only the current cycle subset. Changing mode/seed/exclusions alone
+does not change that full-manifest cache namespace. Existing quota, protected-path,
+partial/range/assembly accounting and two-copy transfer peak policies are unchanged.
+
 ## Once, repeat and failure semantics
 
-- `repeat=False` is the default. Each non-excluded shard is allocated once in the
-  persisted queue. `health()` returns true only when all work is ACKed.
+- `repeat=False` is the default. Shuffle allocates each non-excluded shard once;
+  balance allocates one tar per nonempty folder once. `health()` returns true only
+  when all work selected for that queue is ACKed.
 - `repeat=True` supplies available shards cyclically. An actively leased path is never
   reissued to another worker. A free worker may start another allocation cycle while a
   slower worker still holds an earlier lease. Held paths remain pinned until ACK.
@@ -152,8 +200,9 @@ user. Socket permissions are 0600. This is not a cross-host/network service.
   completed rows remain completed. Old clients/leases are rejected and must reconnect.
   Older-cycle outstanding leases are not durably journaled; repeat mode supplies those
   paths again in later allocation cycles. There is no exactly-once processing guarantee.
-- State binds the exact manifest and excluded path set. Changing either requires a new
-  state file and dedicated cache. A fully consumed once queue stays consumed on restart.
+- State binds the exact manifest and excluded path set (balance also binds mode and
+  seed). Changes require a new state file; a changed manifest requires a fresh cache
+  namespace. A fully consumed once queue stays consumed on restart.
 - Cache quotas include shard data, ranges, partials and assembly files. Admission reserves
   up to **2× each downloading shard's size**, not just its final size, with concurrent
   reservations accounted once. Ownership metadata and filesystem allocation overhead are
@@ -173,9 +222,10 @@ lease/readiness/ACK behavior, restart state, real tiny tar consumption through J
 client/server dispatch, and local CLI inventory creation. Wheel installation/import is
 checked in a fresh environment without Torch installed.
 
-Actual Unix-socket acceptance is **not yet verified** in the current execution environment:
-its OS socket creation returns EPERM, including the permitted elevated test run. The
-three real socket integration cases are explicitly skipped with a BLOCKED reason there;
-in-process dispatch tests are separate and do not substitute for socket coverage.
-Run the suite on the intended Linux host before production use. No live ModelScope
-account/download, production-scale throughput or distributed training test is claimed.
+The original extraction environment blocked Unix sockets with EPERM, so those tests
+retain an explicit BLOCKED skip on such hosts. The balance update was additionally
+verified on local WSL/Linux Python 3.12 with actual Unix sockets, tiny tar payloads,
+local providers and rank-mapped clients; this does not establish acceptance on all
+hosts. In-process dispatch coverage remains separate. Run the suite on the intended
+Linux host before production use. No live ModelScope account/download,
+production-scale throughput, GPU or distributed training test is claimed.

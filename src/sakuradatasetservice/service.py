@@ -16,7 +16,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, Literal, cast
 
 from sakuradatasetservice.cache import CachedShard, ShardCache, ShardCacheError
@@ -33,6 +33,7 @@ from sakuradatasetservice.service_protocol import (
 )
 
 _QUEUE_SCHEMA_VERSION = 3
+_BALANCE_QUEUE_SCHEMA_VERSION = 4
 
 _CLIENT_DISCONNECTED_ERRNOS = frozenset(
     {
@@ -118,7 +119,17 @@ class _QueueStore:
         path: Path,
         manifest: DatasetManifest,
         excluded_paths: frozenset[str],
+        *,
+        sampling: Literal["shuffle", "balance"] = "shuffle",
+        seed: int = 0,
     ) -> None:
+        if not isinstance(sampling, str) or sampling not in {"shuffle", "balance"}:
+            raise ValueError("sampling must be shuffle or balance")
+        if type(seed) is not int or seed < 0:
+            raise ValueError("seed must be a nonnegative integer")
+        self.sampling = sampling
+        self.seed = seed
+        self.excluded_paths = excluded_paths
         self.path = path
         self.manifest = manifest
         excluded = excluded_paths
@@ -129,8 +140,23 @@ class _QueueStore:
         )
         if not self.paths:
             raise DataServiceError("exclusions leave no available shards")
+        groups: dict[str, list[str]] = {}
+        if sampling == "balance":
+            for shard_path in sorted(self.paths):
+                folder = PurePosixPath(shard_path).parent.as_posix()
+                groups.setdefault(folder, []).append(shard_path)
+        self._folders = tuple(tuple(paths) for _, paths in sorted(groups.items()))
 
     def new(self, cycle: int) -> _QueueState:
+        if type(cycle) is not int or cycle < 0:
+            raise DataServiceError("allocation cycle must be a nonnegative integer")
+        if self.sampling == "balance":
+            # Sorted input and a mode-specific local RNG make lookahead and
+            # actual allocation agree without consuming the caller's RNG.
+            rng = random.Random(f"balance:{self.seed}:{cycle}")
+            selected = [rng.choice(paths) for paths in self._folders]
+            rng.shuffle(selected)
+            return _QueueState(cycle, tuple(_Row(path, "pending") for path in selected))
         # Sorting before deterministic per-cycle shuffling makes restart order
         # independent of Python hash randomization and matches lookahead order.
         paths = sorted(self.paths)
@@ -143,7 +169,11 @@ class _QueueStore:
         if (
             type(state.cycle) is not int
             or state.cycle < 0
-            or frozenset(paths) != self.paths
+            or (
+                paths != tuple(row.path for row in self.new(state.cycle).rows)
+                if self.sampling == "balance"
+                else frozenset(paths) != self.paths
+            )
             or len(paths) != len(set(paths))
             or any(
                 row.status not in {"pending", "active", "completed"}
@@ -162,11 +192,26 @@ class _QueueStore:
             if not isinstance(document, dict):
                 raise TypeError
             raw = cast(dict[str, Any], document)
-            if set(raw) != {"cycle", "rows", "schema_version", "manifest"}:
+            if self.sampling == "balance":
+                if (
+                    set(raw) != {
+                        "cycle", "rows", "schema_version", "manifest",
+                        "sampling", "seed", "excluded_paths",
+                    }
+                    or type(raw["schema_version"]) is not int
+                    or raw["schema_version"] != _BALANCE_QUEUE_SCHEMA_VERSION
+                    or raw["sampling"] != "balance"
+                    or type(raw["seed"]) is not int
+                    or raw["seed"] != self.seed
+                    or raw["excluded_paths"] != sorted(self.excluded_paths)
+                ):
+                    raise ValueError
+            elif (
+                set(raw) != {"cycle", "rows", "schema_version", "manifest"}
+                or raw["schema_version"] != _QUEUE_SCHEMA_VERSION
+            ):
                 raise ValueError
-            if raw["schema_version"] != _QUEUE_SCHEMA_VERSION or raw[
-                "manifest"
-            ] != self.manifest.model_dump(mode="json"):
+            if raw["manifest"] != self.manifest.model_dump(mode="json"):
                 raise ValueError
             cycle = raw["cycle"]
             if type(cycle) is not int:
@@ -201,16 +246,20 @@ class _QueueStore:
 
     def save(self, state: _QueueState) -> None:
         self._validate(state)
-        payload = canonical_json_bytes(
-            {
-                "manifest": self.manifest.model_dump(mode="json"),
-                "cycle": state.cycle,
-                "rows": [
-                    {"path": row.path, "status": row.status} for row in state.rows
-                ],
-                "schema_version": _QUEUE_SCHEMA_VERSION,
-            }
-        )
+        document: dict[str, object] = {
+            "manifest": self.manifest.model_dump(mode="json"),
+            "cycle": state.cycle,
+            "rows": [{"path": row.path, "status": row.status} for row in state.rows],
+            "schema_version": _QUEUE_SCHEMA_VERSION,
+        }
+        if self.sampling == "balance":
+            document.update(
+                schema_version=_BALANCE_QUEUE_SCHEMA_VERSION,
+                sampling="balance",
+                seed=self.seed,
+                excluded_paths=sorted(self.excluded_paths),
+            )
+        payload = canonical_json_bytes(document)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
         try:
@@ -239,6 +288,8 @@ class DataSupplyService:
         *,
         excluded_paths: frozenset[str] = frozenset(),
         repeat: bool = False,
+        sampling: Literal["shuffle", "balance"] = "shuffle",
+        seed: int = 0,
     ) -> None:
         if cache.manifest != manifest:
             raise DataServiceError("cache manifest differs from service manifest")
@@ -264,7 +315,9 @@ class DataSupplyService:
         self.cache = cache
         self.identity = identity
         self.limits = limits
-        self.store = _QueueStore(mainset_path, manifest, excluded_paths)
+        self.store = _QueueStore(
+            mainset_path, manifest, excluded_paths, sampling=sampling, seed=seed
+        )
         self.ownership_lock_path = ownership_lock_path
         self._state: _QueueState | None = None
         self._executor = ThreadPoolExecutor(
@@ -586,7 +639,15 @@ class DataSupplyService:
         if descriptor.cycle_index == self.state.cycle:
             completed = self._state_with_status(descriptor.record.path, "completed")
             if self.repeat and all(row.status == "completed" for row in completed.rows):
-                completed = self.store.new(completed.cycle + 1)
+                following = self.store.new(completed.cycle + 1)
+                # This ACK releases its own path, but older-cycle leases stay
+                # held. Do not enter an all-held selection and then skip it.
+                remaining_held = {
+                    item.record.path for lease_id, item in self._outstanding.items()
+                    if lease_id != descriptor.lease_id
+                }
+                if any(row.path not in remaining_held for row in following.rows):
+                    completed = following
             self._commit_state(completed)
         self._retire_lease(descriptor)
         self._schedule_lookahead()
@@ -601,9 +662,10 @@ class DataSupplyService:
         if not self.repeat or self._pending_paths():
             return
         leased = {item.record.path for item in self._outstanding.values()}
-        if not self.store.paths.difference(leased):
+        following = self.store.new(self.state.cycle + 1)
+        if not any(row.path not in leased for row in following.rows):
             return
-        self._commit_state(self.store.new(self.state.cycle + 1))
+        self._commit_state(following)
         self._schedule_lookahead()
 
     def _retire_lease(self, descriptor: ShardLeaseDescriptor) -> None:
