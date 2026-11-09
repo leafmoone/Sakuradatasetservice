@@ -76,13 +76,19 @@ def main(argv: list[str] | None = None) -> None:
         "--sampling",
         choices=("shuffle", "balance"),
         default="shuffle",
-        help="shuffle all candidates, or choose one tar per parent folder per cycle",
+        help="shuffle all candidates, or select up to --per-folder per folder per cycle",
     )
     serve.add_argument(
         "--seed",
         type=_nonnegative_int,
         default=0,
         help="nonnegative balance sampler seed (shuffle keeps its historical order)",
+    )
+    serve.add_argument(
+        "--per-folder",
+        type=int,
+        default=1,
+        help="maximum distinct TARs per folder in balance mode",
     )
     serve.add_argument("--download-concurrency", type=int, default=1)
     serve.add_argument("--cache-low-bytes", type=int, default=0)
@@ -128,6 +134,7 @@ def main(argv: list[str] | None = None) -> None:
         excluded_paths=frozenset(args.exclude),
         sampling=args.sampling,
         seed=args.seed,
+        **({"per_folder": args.per_folder} if args.per_folder != 1 else {}),
     )
     server = DataServiceServer(
         service, state / "data.sock", request_timeout_seconds=30.0

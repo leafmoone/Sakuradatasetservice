@@ -138,25 +138,27 @@ user. Socket permissions are 0600. This is not a cross-host/network service.
 `sampling="shuffle"` (the default) retains the original all-candidate queue and
 historical per-cycle order; `seed` does not change shuffle order. To opt in to
 folder scheduling through the API, use `DataSupplyService(..., sampling="balance",
-seed=44, repeat=True)`. The CLI exposes the same options:
+seed=44, repeat=True)`. Set `per_folder=5` (or `--per-folder 5`) to draw up to five
+distinct TARs from each folder and then shuffle the combined selection. Smaller
+folders contribute every TAR once. The CLI exposes the same options:
 
 ```sh
-sakura-dataset-service serve --local-root my-shards --manifest manifest.json --cache-root balance-cache --state-dir balance-state --cache-high-bytes 4294967296 --sampling balance --seed 44 --repeat
+sakura-dataset-service serve --local-root my-shards --manifest manifest.json --cache-root balance-cache --state-dir balance-state --cache-high-bytes 4294967296 --sampling balance --per-folder 5 --seed 44 --repeat
 ```
 
 Balance starts from the **complete fixed local manifest**, removes `excluded_paths`
 (CLI `--exclude`), then groups the remaining paths by POSIX parent directory. Root
 files share the `.` group; a fully excluded folder contributes no tar. Each cycle
-chooses one tar uniformly within each nonempty folder, then shuffles those chosen
-tars. Sorted folder/candidate inputs and a private `random.Random` seeded with
+chooses up to `per_folder` distinct tars uniformly within each nonempty folder, then
+shuffles those chosen tars. Sorted folder/candidate inputs and a private `random.Random` seeded with
 `f"balance:{seed}:{cycle}"` make restart, next-cycle lookahead and actual allocation
-agree without changing global RNG state. This is the same ordering algorithm as
-SakuraMoon's balance option for the same candidates, exclusions, seed and cycle.
-A folder with many tars gets the same number of selections as a singleton folder;
+agree without changing global RNG state. With `per_folder=1`, this is the same ordering
+algorithm as SakuraMoon's balance option for the same candidates, exclusions, seed and
+cycle. A folder contributes at most `per_folder` tars;
 this does not balance sample counts, bytes or consumer updates. Cross-cycle repeats
 are allowed and finite-cycle coverage of every candidate is not guaranteed.
 
-Balance **once mode selects one tar per folder**, not every tar in the manifest.
+Balance **once mode selects up to `per_folder` tars per folder**, not every tar in the manifest.
 Completion still waits for every selected tar's ACK. In repeat mode, cycles remain
 allocation rounds, not completed epochs: old leases stay held and pinned; a path
 is never leased concurrently twice, and an older-cycle ACK only releases its lease.
@@ -167,10 +169,11 @@ held paths. Other available selected folders can proceed normally.
 
 The queue stays self-contained: balance schema4 records mode, seed, the exact
 excluded path set and the existing complete manifest binding. Restore checks these
-and the exact cycle selection/order. Legacy schema3 remains shuffle-only and is
+and the exact cycle selection/order. Multi-TAR balance uses schema5 and records
+`per_folder`. Legacy schema3 remains shuffle-only and is
 still written by shuffle; neither mode automatically imports the other's queue,
 even if one tar per folder makes their candidate memberships equal. Changing
-sampling, balance seed, exclusions or manifest requires a **new state file** after
+sampling, balance seed, per-folder count, exclusions or manifest requires a **new state file** after
 a controlled stop of the service and consumers. Keep old state if its progress is
 needed. Use independent state/socket/lock directories for concurrent services and
 a separate cache for each cache owner; cache ownership always covers the full
@@ -181,7 +184,7 @@ partial/range/assembly accounting and two-copy transfer peak policies are unchan
 ## Once, repeat and failure semantics
 
 - `repeat=False` is the default. Shuffle allocates each non-excluded shard once;
-  balance allocates one tar per nonempty folder once. `health()` returns true only
+  balance allocates up to `per_folder` tars per nonempty folder once. `health()` returns true only
   when all work selected for that queue is ACKed.
 - `repeat=True` supplies available shards cyclically. An actively leased path is never
   reissued to another worker. A free worker may start another allocation cycle while a

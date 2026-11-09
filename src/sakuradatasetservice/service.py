@@ -34,6 +34,7 @@ from sakuradatasetservice.service_protocol import (
 
 _QUEUE_SCHEMA_VERSION = 3
 _BALANCE_QUEUE_SCHEMA_VERSION = 4
+_MULTI_BALANCE_QUEUE_SCHEMA_VERSION = 5
 
 _CLIENT_DISCONNECTED_ERRNOS = frozenset(
     {
@@ -122,13 +123,19 @@ class _QueueStore:
         *,
         sampling: Literal["shuffle", "balance"] = "shuffle",
         seed: int = 0,
+        per_folder: int = 1,
     ) -> None:
         if not isinstance(sampling, str) or sampling not in {"shuffle", "balance"}:
             raise ValueError("sampling must be shuffle or balance")
         if type(seed) is not int or seed < 0:
             raise ValueError("seed must be a nonnegative integer")
+        if type(per_folder) is not int or per_folder < 1:
+            raise ValueError("per_folder must be a positive integer")
+        if sampling != "balance" and per_folder != 1:
+            raise ValueError("per_folder requires balance sampling")
         self.sampling = sampling
         self.seed = seed
+        self.per_folder = per_folder
         self.excluded_paths = excluded_paths
         self.path = path
         self.manifest = manifest
@@ -154,7 +161,15 @@ class _QueueStore:
             # Sorted input and a mode-specific local RNG make lookahead and
             # actual allocation agree without consuming the caller's RNG.
             rng = random.Random(f"balance:{self.seed}:{cycle}")
-            selected = [rng.choice(paths) for paths in self._folders]
+            selected = (
+                [rng.choice(paths) for paths in self._folders]
+                if self.per_folder == 1
+                else [
+                    p
+                    for paths in self._folders
+                    for p in rng.sample(paths, min(len(paths), self.per_folder))
+                ]
+            )
             rng.shuffle(selected)
             return _QueueState(cycle, tuple(_Row(path, "pending") for path in selected))
         # Sorting before deterministic per-cycle shuffling makes restart order
@@ -193,16 +208,36 @@ class _QueueStore:
                 raise TypeError
             raw = cast(dict[str, Any], document)
             if self.sampling == "balance":
+                extra = {"per_folder"} if self.per_folder != 1 else set()
                 if (
-                    set(raw) != {
-                        "cycle", "rows", "schema_version", "manifest",
-                        "sampling", "seed", "excluded_paths",
+                    set(raw)
+                    != {
+                        "cycle",
+                        "rows",
+                        "schema_version",
+                        "manifest",
+                        "sampling",
+                        "seed",
+                        "excluded_paths",
                     }
+                    | extra
                     or type(raw["schema_version"]) is not int
-                    or raw["schema_version"] != _BALANCE_QUEUE_SCHEMA_VERSION
+                    or raw["schema_version"]
+                    != (
+                        _BALANCE_QUEUE_SCHEMA_VERSION
+                        if self.per_folder == 1
+                        else _MULTI_BALANCE_QUEUE_SCHEMA_VERSION
+                    )
                     or raw["sampling"] != "balance"
                     or type(raw["seed"]) is not int
                     or raw["seed"] != self.seed
+                    or (
+                        self.per_folder != 1
+                        and (
+                            type(raw["per_folder"]) is not int
+                            or raw["per_folder"] != self.per_folder
+                        )
+                    )
                     or raw["excluded_paths"] != sorted(self.excluded_paths)
                 ):
                     raise ValueError
@@ -259,6 +294,11 @@ class _QueueStore:
                 seed=self.seed,
                 excluded_paths=sorted(self.excluded_paths),
             )
+            if self.per_folder != 1:
+                document.update(
+                    schema_version=_MULTI_BALANCE_QUEUE_SCHEMA_VERSION,
+                    per_folder=self.per_folder,
+                )
         payload = canonical_json_bytes(document)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
@@ -290,6 +330,7 @@ class DataSupplyService:
         repeat: bool = False,
         sampling: Literal["shuffle", "balance"] = "shuffle",
         seed: int = 0,
+        per_folder: int = 1,
     ) -> None:
         if cache.manifest != manifest:
             raise DataServiceError("cache manifest differs from service manifest")
@@ -316,7 +357,12 @@ class DataSupplyService:
         self.identity = identity
         self.limits = limits
         self.store = _QueueStore(
-            mainset_path, manifest, excluded_paths, sampling=sampling, seed=seed
+            mainset_path,
+            manifest,
+            excluded_paths,
+            sampling=sampling,
+            seed=seed,
+            per_folder=per_folder,
         )
         self.ownership_lock_path = ownership_lock_path
         self._state: _QueueState | None = None
@@ -643,7 +689,8 @@ class DataSupplyService:
                 # This ACK releases its own path, but older-cycle leases stay
                 # held. Do not enter an all-held selection and then skip it.
                 remaining_held = {
-                    item.record.path for lease_id, item in self._outstanding.items()
+                    item.record.path
+                    for lease_id, item in self._outstanding.items()
                     if lease_id != descriptor.lease_id
                 }
                 if any(row.path not in remaining_held for row in following.rows):
